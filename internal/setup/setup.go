@@ -27,10 +27,18 @@ var (
 	openCodeReadFile = func(path string) ([]byte, error) {
 		return openCodeFS.ReadFile(path)
 	}
+	cursorReadDir = func(path string) ([]os.DirEntry, error) {
+		return cursorFS.ReadDir(path)
+	}
+	cursorReadFile = func(path string) ([]byte, error) {
+		return cursorFS.ReadFile(path)
+	}
 	statFn                             = os.Stat
 	openCodeWriteFileFn                = os.WriteFile
 	readFileFn                         = os.ReadFile
 	writeFileFn                        = os.WriteFile
+	mkdirAllFn                         = os.MkdirAll
+	chmodFn                            = os.Chmod
 	jsonMarshalFn                      = json.Marshal
 	jsonMarshalIndentFn                = json.MarshalIndent
 	injectOpenCodeMCPFn                = injectOpenCodeMCP
@@ -40,10 +48,15 @@ writeCodexMemoryInstructionFilesFn = writeCodexMemoryInstructionFiles
 	injectCodexMCPFn                   = injectCodexMCP
 	injectCodexMemoryConfigFn          = injectCodexMemoryConfig
 	addClaudeCodeAllowlistFn           = AddClaudeCodeAllowlist
+	injectCursorHooksFn                = injectCursorHooks
+	injectCursorMCPFn                  = injectCursorMCP
 )
 
 //go:embed plugins/opencode/*
 var openCodeFS embed.FS
+
+//go:embed plugins/cursor/*
+var cursorFS embed.FS
 
 // Agent represents a supported AI coding agent.
 type Agent struct {
@@ -202,6 +215,11 @@ func SupportedAgents() []Agent {
 			InstallDir:  "managed by claude plugin system",
 		},
 		{
+			Name:        "cursor",
+			Description: "Cursor — Python hooks (sessionStart, preCompact, subagentStop, stop) + MCP registration",
+			InstallDir:  cursorHooksDir(),
+		},
+		{
 			Name:        "gemini-cli",
 			Description: "Gemini CLI — MCP registration plus system prompt compaction recovery",
 			InstallDir:  geminiConfigPath(),
@@ -221,12 +239,14 @@ func Install(agentName string) (*Result, error) {
 		return installOpenCode()
 	case "claude-code":
 		return installClaudeCode()
+	case "cursor":
+		return installCursor()
 	case "gemini-cli":
 		return installGeminiCLI()
 	case "codex":
 		return installCodex()
 	default:
-		return nil, fmt.Errorf("unknown agent: %q (supported: opencode, claude-code, gemini-cli, codex)", agentName)
+		return nil, fmt.Errorf("unknown agent: %q (supported: opencode, claude-code, cursor, gemini-cli, codex)", agentName)
 	}
 }
 
@@ -809,6 +829,226 @@ func upsertTopLevelTOMLString(content, key, value string) string {
 	return strings.TrimSpace(strings.Join(out, "\n")) + "\n"
 }
 
+// ─── Cursor ──────────────────────────────────────────────────────────────────
+
+// cursorHooksScript is the per-script entry in the hooks.json array.
+type cursorHooksScript struct {
+	Command string `json:"command"`
+	Timeout int    `json:"timeout"`
+}
+
+// installCursor copies the embedded Python scripts to ~/.cursor/hooks/engram/,
+// merges the lifecycle hook entries into ~/.cursor/hooks.json, and registers the
+// engram MCP server in ~/.cursor/mcp.json.
+func installCursor() (*Result, error) {
+	hooksDir := cursorHooksDir()
+	if err := mkdirAllFn(hooksDir, 0755); err != nil {
+		return nil, fmt.Errorf("create hooks dir %s: %w", hooksDir, err)
+	}
+
+	files := 0
+
+	// Copy embedded Python scripts to ~/.cursor/hooks/engram/
+	scriptEntries, err := cursorReadDir("plugins/cursor/scripts")
+	if err != nil {
+		return nil, fmt.Errorf("read embedded cursor scripts: %w", err)
+	}
+	for _, entry := range scriptEntries {
+		if entry.IsDir() {
+			continue
+		}
+		data, err := cursorReadFile("plugins/cursor/scripts/" + entry.Name())
+		if err != nil {
+			return nil, fmt.Errorf("read embedded script %s: %w", entry.Name(), err)
+		}
+		dest := filepath.Join(hooksDir, entry.Name())
+		if err := writeFileFn(dest, data, 0755); err != nil {
+			return nil, fmt.Errorf("write %s: %w", dest, err)
+		}
+		// Ensure executable bit even on systems that ignore the WriteFile mode
+		if err := chmodFn(dest, 0755); err != nil {
+			return nil, fmt.Errorf("chmod %s: %w", dest, err)
+		}
+		files++
+	}
+
+	// Copy embedded Cursor rules to ~/.cursor/rules/
+	rulesDir := cursorRulesDir()
+	if err := mkdirAllFn(rulesDir, 0755); err != nil {
+		return nil, fmt.Errorf("create rules dir %s: %w", rulesDir, err)
+	}
+	ruleEntries, err := cursorReadDir("plugins/cursor/rules")
+	if err != nil {
+		return nil, fmt.Errorf("read embedded cursor rules: %w", err)
+	}
+	for _, entry := range ruleEntries {
+		if entry.IsDir() {
+			continue
+		}
+		data, err := cursorReadFile("plugins/cursor/rules/" + entry.Name())
+		if err != nil {
+			return nil, fmt.Errorf("read embedded rule %s: %w", entry.Name(), err)
+		}
+		dest := filepath.Join(rulesDir, entry.Name())
+		if err := writeFileFn(dest, data, 0644); err != nil {
+			return nil, fmt.Errorf("write %s: %w", dest, err)
+		}
+		files++
+	}
+
+	// Merge lifecycle hooks into ~/.cursor/hooks.json
+	if err := injectCursorHooksFn(hooksDir); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: could not auto-configure ~/.cursor/hooks.json: %v\n", err)
+		fmt.Fprintf(os.Stderr, "  Add the hook entries manually — see plugin/cursor/.cursor/hooks.json for the full config.\n")
+	} else {
+		files++
+	}
+
+	// Register engram MCP server in ~/.cursor/mcp.json
+	if err := injectCursorMCPFn(); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: could not auto-register MCP server in ~/.cursor/mcp.json: %v\n", err)
+		fmt.Fprintf(os.Stderr, "  Add manually: {\"mcpServers\":{\"engram\":{\"command\":\"engram\",\"args\":[\"mcp\",\"--tools=agent\"]}}}\n")
+	} else {
+		files++
+	}
+
+	return &Result{
+		Agent:       "cursor",
+		Destination: hooksDir,
+		Files:       files,
+	}, nil
+}
+
+// injectCursorHooks merges engram's four hook entries into ~/.cursor/hooks.json,
+// preserving any existing hooks the user has configured. Idempotent: existing
+// engram entries are replaced rather than duplicated.
+func injectCursorHooks(scriptsDir string) error {
+	hooksPath := cursorHooksJSONPath()
+	if err := mkdirAllFn(filepath.Dir(hooksPath), 0755); err != nil {
+		return fmt.Errorf("create cursor config dir: %w", err)
+	}
+
+	// hooksFile is the shape of ~/.cursor/hooks.json
+	type hooksFile struct {
+		Version int                             `json:"version"`
+		Hooks   map[string][]cursorHooksScript  `json:"hooks"`
+	}
+
+	var config hooksFile
+	data, err := readFileFn(hooksPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			config = hooksFile{Version: 1, Hooks: make(map[string][]cursorHooksScript)}
+		} else {
+			return fmt.Errorf("read hooks.json: %w", err)
+		}
+	} else {
+		if err := json.Unmarshal(data, &config); err != nil {
+			return fmt.Errorf("parse hooks.json: %w", err)
+		}
+		if config.Hooks == nil {
+			config.Hooks = make(map[string][]cursorHooksScript)
+		}
+		if config.Version == 0 {
+			config.Version = 1
+		}
+	}
+
+	// The four engram hook entries. Scripts are invoked via absolute path so
+	// they work regardless of which directory Cursor runs them from.
+	engramHooks := map[string]cursorHooksScript{
+		"sessionStart": {Command: "python3 " + filepath.Join(scriptsDir, "session_start.py"), Timeout: 10},
+		"preCompact":   {Command: "python3 " + filepath.Join(scriptsDir, "post_compaction.py"), Timeout: 10},
+		"subagentStop": {Command: "python3 " + filepath.Join(scriptsDir, "subagent_stop.py"), Timeout: 10},
+		"stop":         {Command: "python3 " + filepath.Join(scriptsDir, "session_stop.py"), Timeout: 5},
+	}
+
+	for event, entry := range engramHooks {
+		existing := config.Hooks[event]
+		// Remove any previous engram entry for this event (idempotent update)
+		var filtered []cursorHooksScript
+		for _, s := range existing {
+			if !strings.Contains(s.Command, "engram") {
+				filtered = append(filtered, s)
+			}
+		}
+		config.Hooks[event] = append(filtered, entry)
+	}
+
+	output, err := jsonMarshalIndentFn(config, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal hooks.json: %w", err)
+	}
+	if err := writeFileFn(hooksPath, output, 0644); err != nil {
+		return fmt.Errorf("write hooks.json: %w", err)
+	}
+
+	return nil
+}
+
+// injectCursorMCP adds the engram server entry to ~/.cursor/mcp.json.
+// Idempotent: skips if already registered.
+func injectCursorMCP() error {
+	mcpPath := cursorMCPPath()
+	if err := mkdirAllFn(filepath.Dir(mcpPath), 0755); err != nil {
+		return fmt.Errorf("create cursor config dir: %w", err)
+	}
+
+	var config map[string]json.RawMessage
+	data, err := readFileFn(mcpPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			config = make(map[string]json.RawMessage)
+		} else {
+			return fmt.Errorf("read mcp.json: %w", err)
+		}
+	} else {
+		if err := json.Unmarshal(data, &config); err != nil {
+			return fmt.Errorf("parse mcp.json: %w", err)
+		}
+	}
+
+	// Parse or create the mcpServers block
+	var mcpServers map[string]json.RawMessage
+	if raw, exists := config["mcpServers"]; exists {
+		if err := json.Unmarshal(raw, &mcpServers); err != nil {
+			return fmt.Errorf("parse mcpServers block: %w", err)
+		}
+	} else {
+		mcpServers = make(map[string]json.RawMessage)
+	}
+
+	if _, exists := mcpServers["engram"]; exists {
+		return nil // already registered
+	}
+
+	engramEntry := map[string]any{
+		"command": "engram",
+		"args":    []string{"mcp", "--tools=agent"},
+	}
+	entryJSON, err := jsonMarshalFn(engramEntry)
+	if err != nil {
+		return fmt.Errorf("marshal engram entry: %w", err)
+	}
+	mcpServers["engram"] = json.RawMessage(entryJSON)
+
+	mcpJSON, err := jsonMarshalFn(mcpServers)
+	if err != nil {
+		return fmt.Errorf("marshal mcpServers block: %w", err)
+	}
+	config["mcpServers"] = json.RawMessage(mcpJSON)
+
+	output, err := jsonMarshalIndentFn(config, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshal mcp.json: %w", err)
+	}
+	if err := writeFileFn(mcpPath, output, 0644); err != nil {
+		return fmt.Errorf("write mcp.json: %w", err)
+	}
+
+	return nil
+}
+
 // ─── Platform paths ──────────────────────────────────────────────────────────
 
 func openCodePluginDir() string {
@@ -857,4 +1097,30 @@ func codexInstructionsPath() string {
 
 func codexCompactPromptPath() string {
 	return filepath.Join(filepath.Dir(codexConfigPath()), "engram-compact-prompt.md")
+}
+
+// cursorConfigDir returns ~/.cursor on all platforms.
+func cursorConfigDir() string {
+	home, _ := userHomeDir()
+	return filepath.Join(home, ".cursor")
+}
+
+// cursorHooksDir returns the directory where engram's Python hooks are installed.
+func cursorHooksDir() string {
+	return filepath.Join(cursorConfigDir(), "hooks", "engram")
+}
+
+// cursorHooksJSONPath returns the path to the global Cursor hooks config.
+func cursorHooksJSONPath() string {
+	return filepath.Join(cursorConfigDir(), "hooks.json")
+}
+
+// cursorMCPPath returns the path to the global Cursor MCP config.
+func cursorMCPPath() string {
+	return filepath.Join(cursorConfigDir(), "mcp.json")
+}
+
+// cursorRulesDir returns ~/.cursor/rules — the global Cursor rules directory.
+func cursorRulesDir() string {
+	return filepath.Join(cursorConfigDir(), "rules")
 }

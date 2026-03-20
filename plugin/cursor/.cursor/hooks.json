@@ -1,0 +1,29 @@
+{
+  "version": 1,
+  "hooks": {
+    "sessionStart": [
+      {
+        "command": "python3 ~/.cursor/hooks/engram/session_start.py",
+        "timeout": 10
+      }
+    ],
+    "preCompact": [
+      {
+        "command": "python3 ~/.cursor/hooks/engram/post_compaction.py",
+        "timeout": 10
+      }
+    ],
+    "subagentStop": [
+      {
+        "command": "python3 ~/.cursor/hooks/engram/subagent_stop.py",
+        "timeout": 10
+      }
+    ],
+    "stop": [
+      {
+        "command": "python3 ~/.cursor/hooks/engram/session_stop.py",
+        "timeout": 5
+      }
+    ]
+  }
+}
